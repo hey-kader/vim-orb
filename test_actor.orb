@@ -1,0 +1,253 @@
+*              
+*  Alan        
+*  Actor       
+*  Background  
+*              
+
+What follows is an attempt to make legible some of the most important
+conventions of the bridge project.
+
+A perusal of the [[style guide][httk://]] for Lua would be a good prerequisite
+to reading this document generally, and this section in particular.
+
+*** Actors in Bridge 
+What does it mean to say an artifact of code is an actor?
+
+Let us begin by discussing objects, since in historic terms the concept of
+actor is that which Alan Kay has blessed as following his original vision for
+that term.  Which has overloaded, overlaid, and even convoluted meanings in
+the contemporary discourse.
+
+An object, in systems terms, is a block of memory treated as a single record,
+which is associated with functions (procedures in Wirthian dialect) which
+receive that layout as the first parameter.  Forth can notoriously reify a
+full object system on one punchcard or "block".
+
+Lua evolved as an adjunct language to C, and shares that concept of what an
+object is.  Lua provides metatables and metamethods, the skeleton of a
+metaobject protocol in the CLOS sense, but doesn't refer to objects, or
+provide them as anything other than the basic structs which make up Lua types.
+
+This is a table: ={}=.  It is a map of anything, including itself, excluding
+only =nil=, to anything else except =nil=.  Or if you prefer, it's a map of
+absolutely everything except =nil=, to =nil=, except where otherwise
+specified.  Lua will throw an error if the user attempts a =nil= key for an
+lvalue slot.
+
+A table with a metatable, =setmetatable({}, Metatable)= is: a table with a
+metatable.  Metatables, and metamethods, are the [[Meta Object Protocol]†] of
+the Lua language, and they are magnificent.
+
+[†]: https://en.wikipedia.org/wiki/The_Art_of_the_Metaobject_Protocol
+
+To expand a bit on objects: strings are very clearly objects.
+===(" "):rep(5) == "     "=== makes this perfectly clear.  Functions, being
+first-class closures, are also objects, we can introspect them and change
+their state; coroutines as well.
+
+I see no reason to declare the other types to be "primitives", because Lua
+semantics don't require it.  The fact that we can't say =(2):times(print,
+"hello")= is effectively an implementation detail.  I'll grant you, it would
+be pretty cool if we could!  We can control the meaning of =2 + tab= with
+metamethods, that's good enough.
+
+So sometimes it's quite sensible to refer to a table as an "object", when
+we're considering it as a concrete artifact in the Lua runtime.  But usually
+we can be more specific.
+
+
+**** Of Modules and Instances 
+
+A common pattern for a module is to define a metatable, with associated
+metamethods and such machinery.  Such a module ends (usually) with a function
+called =new=.  =new= is assigned to a slot on the metatable,
+==Metatable.idEst = new==, and the function is returned.
+
+This sort of module, when imported, is invariably done as follows:
+
+| 
+#!lua #noKnit
+  local Widget = require "widget:widget"
+#/lua
+   
+   
+that is, what was called =new= in the module =./orb/widget/widget.orb=, is
+called =Widget= at the consumer side.  =new= will take some number of
+parameters, greater than or equal to zero, and return an /instance/ of Widget.
+We avoid calling Widget a class! It's already a module, and a metatable, and
+a constructor of instances: that's a lot of things for one word to be, and
+there's no /one thing/ which has the Widget-nature already, so why keep adding
+nouns?
+
+What this gets us is that the following generally holds true:
+
+|
+#!lua #noKnit
+  local Widget = require "widget:widget"
+  local thingum = Widget()
+  assert(thingum.idEst == Widget, "this property normally holds")
+#/lua
+
+As an aside, this isn't flexible enough, and soon, before the year is out even,
+we'll have to bite the bullet and rewrite it so that the call is
+=thingum:idEst(Widget)=, where the simple case has =widget.orb= containing
+==Widget.__type = new== after the constructor is defined.
+
+We describe any value accessed with a dot as a /field/, and if the value lives
+on the table itself, rather than being returned through =__index=, it is also
+a /slot/, so =instance.field=.  Any valued accessed with a colon is a /method/,
+and must be callable, so a function or a table with a =__call= metamethod: we
+call this /passing a message/, so =instance:message(...)=.
+
+When a callable is or isn't a method is not objective, we can and do refer to
+private functions which take the instance as the first parameter as methods,
+and use the =methodCase=, generally with the =_privateModifier=, to define
+them.  After all, if we simply assigned them to a field on the metatable, they
+would become a method, proper, and functions get moved onto and off of
+metatables all the time, depending on whether it's useful to have them outside
+the module.
+
+Bridge code never, ever uses =self=, we invariably define a method in the form
+=function Widget.method(widget, ...)=, although the /section header/ will say
+
+*** widget:method(...)=. 
+*** imports              
+ 
+| 
+#!lua
+  local _base = require "core:_base"
+  local iscallable = assert(_base.iscallable)
+  local meta = assert(require "core:cluster" . Meta)
+  local constructor = assert(require "core:cluster" . constructor)
+#/lua
+
+
+** actor library
+
+|
+#!lua
+  local act = meta {}
+#/lua
+
+
+*** act.borrowmethod(actor, method)
+
+  This function takes an Actor and a method, and returns a closure which a)
+will call the method with the Actor as the first parameter and b) will not
+retain a strong reference to the Actor.
+
+The method may be either a callable or a string.  A callable is used directly,
+and a string is used at call-time to retrieve a method from the Actor and call
+it.
+
+Both options are provided, because with the callable, it doesn't have to be an
+actual method on a field of the Actor, and with the string, the method itself
+can change and will still be called.
+
+We do this with an anonymous index table and a weak attribute table, which we
+use to retrieve the Actor and method if they haven't gone out of scope.
+
+|
+#!lua
+  local __act_mth_attr = setmetatable({}, { __mode = 'kv' })
+  function act.borrowmethod(actor, method)
+     assert(iscallable(method) or type(method) == 'string',
+          "#2 for borrowmethod must be string or callable")
+     local uid = {}
+     __act_mth_attr[uid] = actor
+     actor = nil
+     if type(method) == 'string' then
+      -- return a lookup function
+      return function(...)
+         local _actor = __act_mth_attr[uid]
+         if not _actor then
+            error "actor has gone out of scope"
+         end
+         return _actor[method](_actor, ...)
+      end
+   else
+      --return a direct-call function
+      return function(...)
+         local _actor = __act_mth_attr[uid]
+         if not _actor then
+            error "actor has gone out of scope"
+         end
+         return method(_actor, ...)
+      end
+   end
+end
+#/lua
+
+** act.getter(actor, slot) 
+
+  Provides a closure which will return the value of the slot on the given
+actor.
+
+| 
+#!lua
+  local __act_getter_attr = setmetatable({}, { __mode = 'kv' })
+  function act.getter(actor, slot)
+  local uid = {}
+  __act_getter_attr[uid] = actor
+  actor = nil
+  return function()
+  local _actor = __act_getter_attr[uid]
+    if not _actor then
+      error "actor has gone out of scope"
+      end
+      return _actor[slot]
+    end
+  end
+#/lua
+
+** act.dispatchmessage(actor, msg)
+  
+|
+#!lua
+  local function dispatchmessage(actor, msg)
+  local _cyc = {}
+  local function _dispatch(actor, msg)
+      detect potential cycles
+   if _cyc[msg] then error "cycle in Message" end
+      _cyc[msg] = true
+      -- handle recursive case first
+      if msg.message then
+         actor :dispatchmessage(msg.message)
+         return actor
+      end
+      if msg.sendto then
+         actor = actor[msg.sendto]
+      elseif msg.property then
+         actor = actor[msg.property]
+      elseif msg.call == true then
+         actor = actor(unpack(msg))
+      elseif msg.call then
+         actor = actor[msg.call](unpack(msg))
+      elseif msg.method then
+         actor = actor[msg.method](actor, unpack(msg))
+      else
+         error("Message must have one of property, call, or method")
+      end
+  end
+  _dispatch(actor, msg)
+  return actor
+  end
+  act.dispatchmessage = dispatchmessage
+#/lua 
+
+* actor 
+the canonical interface for Actors is the [[Message][]]
+and =:dispatchmessage=.
+
+|
+#!lua  
+  local function new()
+  return { dispatchmessage = dispatchmessage }
+  end
+  act.new = new
+#/lua
+
+| 
+#!lua
+  local Actor = constructor(act, new)
+#/lua
